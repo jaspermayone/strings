@@ -11,26 +11,51 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # Pre-fetch node_modules as a fixed-output derivation
+        nodeModules = pkgs.stdenv.mkDerivation {
+          name = "strings-node-modules";
+          src = ./.;
+
+          nativeBuildInputs = [ pkgs.bun pkgs.cacert ];
+
+          # Fixed-output derivation - allows network access but requires hash
+          outputHashMode = "recursive";
+          outputHashAlgo = "sha256";
+          outputHash = "sha256-40uExawvAkHS9Sz8KRo6tpbKXNkkxbzBvdCkULruYqM=";
+
+          buildPhase = ''
+            runHook preBuild
+            export HOME=$(mktemp -d)
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            bun install --frozen-lockfile
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r node_modules $out/
+            runHook postInstall
+          '';
+        };
+
         strings = pkgs.stdenv.mkDerivation {
           pname = "strings";
           version = "0.1.0";
 
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bun pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          buildPhase = ''
-            runHook preBuild
-            export HOME=$(mktemp -d)
-            bun install
-            runHook postBuild
-          '';
+          # No build phase needed - deps are pre-fetched
+          dontBuild = true;
 
           installPhase = ''
             runHook preInstall
 
             mkdir -p $out/lib/strings $out/bin
-            cp -r src package.json node_modules $out/lib/strings/
+            cp -r src package.json $out/lib/strings/
+            ln -s ${nodeModules}/node_modules $out/lib/strings/node_modules
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/strings \
               --add-flags "run $out/lib/strings/src/index.ts"
