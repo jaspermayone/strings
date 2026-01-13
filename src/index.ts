@@ -1,280 +1,15 @@
 import { Database } from "bun:sqlite";
-import { readFileSync } from "fs";
-import { Hono } from "hono";
-import { basicAuth } from "hono/basic-auth";
 
-// Config from environment
-const PORT = parseInt(process.env.PORT || "3000");
-const DB_PATH = process.env.DB_PATH || "./strings.db";
-const USERNAME = process.env.AUTH_USERNAME || "admin";
-
-// Load auth password from file or env
-function loadPassword(): string {
-  if (process.env.AUTH_PASSWORD_FILE) {
-    try {
-      return readFileSync(process.env.AUTH_PASSWORD_FILE, "utf-8").trim();
-    } catch (e) {
-      console.error("Failed to read AUTH_PASSWORD_FILE:", e);
-      process.exit(1);
-    }
-  }
-  return process.env.AUTH_PASSWORD || "changeme";
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
-const PASSWORD = loadPassword();
-
-// Initialize database
-const db = new Database(DB_PATH);
-db.run(`
-  CREATE TABLE IF NOT EXISTS pastes (
-    id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    filename TEXT,
-    language TEXT,
-    created_at INTEGER DEFAULT (unixepoch())
-  )
-`);
-
-// Generate random ID
-function generateId(length = 8): string {
-  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let result = "";
-  for (let i = 0; i < length; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return result;
-}
-
-// Validate custom slug
-function isValidSlug(slug: string): boolean {
-  return /^[a-zA-Z0-9_-]{1,64}$/.test(slug);
-}
-
-// Check if ID exists
-function idExists(id: string): boolean {
-  const row = db.query("SELECT 1 FROM pastes WHERE id = ?").get(id);
-  return row !== null;
-}
-
-// Infer language from filename
-function inferLanguage(filename?: string): string | undefined {
-  if (!filename) return undefined;
-  const ext = filename.split(".").pop()?.toLowerCase();
-  const langMap: Record<string, string> = {
-    js: "javascript",
-    ts: "typescript",
-    jsx: "javascript",
-    tsx: "typescript",
-    py: "python",
-    rb: "ruby",
-    rs: "rust",
-    go: "go",
-    java: "java",
-    c: "c",
-    cpp: "cpp",
-    h: "c",
-    hpp: "cpp",
-    cs: "csharp",
-    php: "php",
-    swift: "swift",
-    kt: "kotlin",
-    scala: "scala",
-    sh: "bash",
-    bash: "bash",
-    zsh: "bash",
-    fish: "fish",
-    ps1: "powershell",
-    sql: "sql",
-    html: "html",
-    css: "css",
-    scss: "scss",
-    sass: "sass",
-    less: "less",
-    json: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    toml: "toml",
-    xml: "xml",
-    md: "markdown",
-    markdown: "markdown",
-    nix: "nix",
-    dockerfile: "dockerfile",
-    makefile: "makefile",
-    cmake: "cmake",
-    ex: "elixir",
-    exs: "elixir",
-    erl: "erlang",
-    hs: "haskell",
-    lua: "lua",
-    r: "r",
-    jl: "julia",
-    vim: "vim",
-    tf: "hcl",
-  };
-  return ext ? langMap[ext] : undefined;
-}
-
-const app = new Hono();
-
-// Basic auth middleware
-const auth = basicAuth({
-  username: USERNAME,
-  password: PASSWORD,
-});
-
-// Create paste - API
-app.post("/api/paste", auth, async (c) => {
-  const contentType = c.req.header("Content-Type") || "";
-
-  let content: string;
-  let filename: string | undefined;
-  let language: string | undefined;
-  let customSlug: string | undefined;
-
-  if (contentType.includes("application/json")) {
-    const body = await c.req.json();
-    content = body.content;
-    filename = body.filename;
-    language = body.language;
-    customSlug = body.slug;
-  } else {
-    content = await c.req.text();
-    filename = c.req.header("X-Filename") || undefined;
-    language = c.req.header("X-Language") || undefined;
-    customSlug = c.req.header("X-Slug") || undefined;
-  }
-
-  if (!content) {
-    return c.json({ error: "Content is required" }, 400);
-  }
-
-  // Handle custom slug or generate random ID
-  let id: string;
-  if (customSlug) {
-    if (!isValidSlug(customSlug)) {
-      return c.json({ error: "Invalid slug. Use 1-64 alphanumeric characters, hyphens, or underscores." }, 400);
-    }
-    if (idExists(customSlug)) {
-      return c.json({ error: "Slug already taken" }, 409);
-    }
-    id = customSlug;
-  } else {
-    do {
-      id = generateId();
-    } while (idExists(id));
-  }
-
-  // Infer language from filename if not provided
-  if (!language && filename) {
-    language = inferLanguage(filename);
-  }
-
-  db.run(
-    "INSERT INTO pastes (id, content, filename, language) VALUES (?, ?, ?, ?)",
-    [id, content, filename || null, language || null]
-  );
-
-  const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
-
-  return c.json({
-    id,
-    url: `${baseUrl}/${id}`,
-    raw: `${baseUrl}/${id}/raw`,
-  });
-});
-
-// Create paste - Form submission
-app.post("/new", auth, async (c) => {
-  const form = await c.req.formData();
-  const content = form.get("content") as string;
-  const filename = form.get("filename") as string || undefined;
-  const language = form.get("language") as string || undefined;
-  const customSlug = form.get("slug") as string || undefined;
-
-  if (!content) {
-    return c.html(newPastePage("Content is required"), 400);
-  }
-
-  let id: string;
-  if (customSlug) {
-    if (!isValidSlug(customSlug)) {
-      return c.html(newPastePage("Invalid slug. Use 1-64 alphanumeric characters, hyphens, or underscores."), 400);
-    }
-    if (idExists(customSlug)) {
-      return c.html(newPastePage("Slug already taken"), 409);
-    }
-    id = customSlug;
-  } else {
-    do {
-      id = generateId();
-    } while (idExists(id));
-  }
-
-  const inferredLang = language || inferLanguage(filename || undefined);
-
-  db.run(
-    "INSERT INTO pastes (id, content, filename, language) VALUES (?, ?, ?, ?)",
-    [id, content, filename || null, inferredLang || null]
-  );
-
-  return c.redirect(`/${id}`);
-});
-
-// New paste form
-app.get("/new", auth, (c) => {
-  return c.html(newPastePage());
-});
-
-// Get paste (HTML view)
-app.get("/:id", async (c) => {
-  const id = c.req.param("id");
-
-  // Don't match special routes
-  if (id === "new" || id === "api") {
-    return c.notFound();
-  }
-
-  const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as any;
-
-  if (!paste) {
-    return c.html(errorPage("Paste not found"), 404);
-  }
-
-  return c.html(renderPaste(paste));
-});
-
-// Get raw paste
-app.get("/:id/raw", async (c) => {
-  const id = c.req.param("id");
-
-  const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as any;
-
-  if (!paste) {
-    return c.text("Paste not found", 404);
-  }
-
-  return c.text(paste.content);
-});
-
-// Delete paste
-app.delete("/:id", auth, async (c) => {
-  const id = c.req.param("id");
-
-  const result = db.run("DELETE FROM pastes WHERE id = ?", [id]);
-
-  if (result.changes === 0) {
-    return c.json({ error: "Paste not found" }, 404);
-  }
-
-  return c.json({ deleted: true });
-});
-
-// Home page
-app.get("/", (c) => {
-  return c.html(homePage());
-});
-
-function homePage(): string {
+function homeHtml() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -345,7 +80,123 @@ cat myfile.rs | curl -u user:pass -X POST <span class="endpoint">https://strings
 </html>`;
 }
 
-function newPastePage(error?: string): string {
+function errorPage(message: string) {
+  const escaped = escapeHtml(message);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Error - strings</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .error {
+      text-align: center;
+    }
+    h1 { color: #f85149; margin-bottom: 1rem; }
+    a { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <div class="error">
+    <h1>${escaped}</h1>
+    <a href="/">← back home</a>
+  </div>
+</body>
+</html>`;
+}
+
+function renderPaste(paste: Paste) {
+  const lang = paste.language || "plaintext";
+  const filename = paste.filename ? escapeHtml(paste.filename) : paste.id;
+  const title = `${filename} - strings`;
+  const content = escapeHtml(paste.content);
+  
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title}</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+    }
+    .header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .header a { color: #58a6ff; text-decoration: none; }
+    .header a:hover { text-decoration: underline; }
+    .filename { font-weight: 600; color: #c9d1d9; }
+    .meta { color: #8b949e; font-size: 0.875rem; }
+    .actions a {
+      color: #8b949e;
+      margin-left: 1rem;
+      font-size: 0.875rem;
+    }
+    .code-wrapper {
+      margin: 1rem;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    pre {
+      margin: 0;
+      padding: 1rem;
+      overflow-x: auto;
+      background: #0d1117 !important;
+    }
+    code {
+      font-family: 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 0.875rem;
+      line-height: 1.5;
+    }
+    .hljs { background: #0d1117 !important; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <a href="/">strings</a>
+      <span class="filename"> / ${filename}</span>
+      <span class="meta"> · ${lang}</span>
+    </div>
+    <div class="actions">
+      <a href="/${paste.id}/raw">raw</a>
+      <a href="/new">+ new</a>
+    </div>
+  </div>
+  <div class="code-wrapper">
+    <pre><code class="language-${lang}">${content}</code></pre>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</body>
+</html>`;
+}
+
+function newPastePage(error?: string) {
+  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : "";
+  
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -424,12 +275,15 @@ function newPastePage(error?: string): string {
       background: #161b22;
       border-right: 1px solid #30363d;
     }
+    #editor {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1><a href="/">strings</a> / new</h1>
-    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    ${errorHtml}
     <form method="POST" action="/new">
       <label>
         Content
@@ -588,130 +442,343 @@ function newPastePage(error?: string): string {
 </html>`;
 }
 
-function renderPaste(paste: any): string {
-  const lang = paste.language || "plaintext";
-  const escaped = escapeHtml(paste.content);
-  const filename = paste.filename ? escapeHtml(paste.filename) : paste.id;
+type Paste = {
+  id: string;
+  content: string;
+  filename: string | null;
+  language: string | null;
+  created_at: number;
+};
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${filename} - strings</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0d1117;
-      color: #c9d1d9;
-      min-height: 100vh;
+// Config from environment
+const PORT = parseInt(process.env.PORT || "3000");
+const DB_PATH = process.env.DB_PATH || "./strings.db";
+const USERNAME = process.env.AUTH_USERNAME || "admin";
+
+// Load auth password from file or env
+async function loadPassword(): Promise<string> {
+  if (process.env.AUTH_PASSWORD_FILE) {
+    try {
+      const file = Bun.file(process.env.AUTH_PASSWORD_FILE);
+      return (await file.text()).trim();
+    } catch (e) {
+      console.error("Failed to read AUTH_PASSWORD_FILE:", e);
+      process.exit(1);
     }
-    .header {
-      background: #161b22;
-      border-bottom: 1px solid #30363d;
-      padding: 1rem 2rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .header a { color: #58a6ff; text-decoration: none; }
-    .header a:hover { text-decoration: underline; }
-    .filename { font-weight: 600; color: #c9d1d9; }
-    .meta { color: #8b949e; font-size: 0.875rem; }
-    .actions a {
-      color: #8b949e;
-      margin-left: 1rem;
-      font-size: 0.875rem;
-    }
-    .code-wrapper {
-      margin: 1rem;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      overflow: hidden;
-    }
-    pre {
-      margin: 0;
-      padding: 1rem;
-      overflow-x: auto;
-      background: #0d1117 !important;
-    }
-    code {
-      font-family: 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
-      font-size: 0.875rem;
-      line-height: 1.5;
-    }
-    .hljs { background: #0d1117 !important; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <div>
-      <a href="/">strings</a>
-      <span class="filename"> / ${filename}</span>
-      <span class="meta"> · ${lang}</span>
-    </div>
-    <div class="actions">
-      <a href="/${paste.id}/raw">raw</a>
-      <a href="/new">+ new</a>
-    </div>
-  </div>
-  <div class="code-wrapper">
-    <pre><code class="language-${lang}">${escaped}</code></pre>
-  </div>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  <script>hljs.highlightAll();</script>
-</body>
-</html>`;
+  }
+  return process.env.AUTH_PASSWORD || "changeme";
 }
 
-function errorPage(message: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Error - strings</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0d1117;
-      color: #c9d1d9;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-    }
-    .error {
-      text-align: center;
-    }
-    h1 { color: #f85149; margin-bottom: 1rem; }
-    a { color: #58a6ff; }
-  </style>
-</head>
-<body>
-  <div class="error">
-    <h1>${escapeHtml(message)}</h1>
-    <a href="/">← back home</a>
-  </div>
-</body>
-</html>`;
+const PASSWORD = await loadPassword();
+
+// Initialize database
+const db = new Database(DB_PATH);
+db.run(`
+  CREATE TABLE IF NOT EXISTS pastes (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    filename TEXT,
+    language TEXT,
+    created_at INTEGER DEFAULT (unixepoch())
+  )
+`);
+
+// Generate random ID
+function generateId(length = 8): string {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return result;
 }
 
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+// Validate custom slug
+function isValidSlug(slug: string): boolean {
+  return /^[a-zA-Z0-9_-]{1,64}$/.test(slug);
+}
+
+// Check if ID exists
+function idExists(id: string): boolean {
+  const row = db.query("SELECT 1 FROM pastes WHERE id = ?").get(id);
+  return row !== null;
+}
+
+// Infer language from filename
+function inferLanguage(filename?: string): string | undefined {
+  if (!filename) return undefined;
+  const ext = filename.split(".").pop()?.toLowerCase();
+  const langMap: Record<string, string> = {
+    js: "javascript",
+    ts: "typescript",
+    jsx: "javascript",
+    tsx: "typescript",
+    py: "python",
+    rb: "ruby",
+    rs: "rust",
+    go: "go",
+    java: "java",
+    c: "c",
+    cpp: "cpp",
+    h: "c",
+    hpp: "cpp",
+    cs: "csharp",
+    php: "php",
+    swift: "swift",
+    kt: "kotlin",
+    scala: "scala",
+    sh: "bash",
+    bash: "bash",
+    zsh: "bash",
+    fish: "fish",
+    ps1: "powershell",
+    sql: "sql",
+    html: "html",
+    css: "css",
+    scss: "scss",
+    sass: "sass",
+    less: "less",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    toml: "toml",
+    xml: "xml",
+    md: "markdown",
+    markdown: "markdown",
+    nix: "nix",
+    dockerfile: "dockerfile",
+    makefile: "makefile",
+    cmake: "cmake",
+    ex: "elixir",
+    exs: "elixir",
+    erl: "erlang",
+    hs: "haskell",
+    lua: "lua",
+    r: "r",
+    jl: "julia",
+    vim: "vim",
+    tf: "hcl",
+  };
+  return ext ? langMap[ext] : undefined;
+}
+
+// Basic auth helper
+function checkAuth(req: Request): boolean {
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    return false;
+  }
+
+  const base64Credentials = authHeader.slice(6);
+  const credentials = atob(base64Credentials);
+  const [username, password] = credentials.split(":");
+
+  return username === USERNAME && password === PASSWORD;
+}
+
+function unauthorizedResponse(): Response {
+  return new Response("Unauthorized", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Secure Area"',
+    },
+  });
+}
+
+function getOrCreateId(customSlug?: string): string {
+  if (customSlug) {
+    if (!isValidSlug(customSlug)) {
+      throw new Error("Invalid slug. Use 1-64 alphanumeric characters, hyphens, or underscores.");
+    }
+    if (idExists(customSlug)) {
+      throw new Error("Slug already taken");
+    }
+    return customSlug;
+  }
+  
+  let id: string;
+  do {
+    id = generateId();
+  } while (idExists(id));
+  return id;
+}
+
+// Router
+async function handleRequest(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const method = req.method;
+
+  // Create paste - API
+  if (method === "POST" && path === "/api/paste") {
+    if (!checkAuth(req)) return unauthorizedResponse();
+
+    const contentType = req.headers.get("Content-Type") || "";
+
+    let content: string;
+    let filename: string | undefined;
+    let language: string | undefined;
+    let customSlug: string | undefined;
+
+    if (contentType.includes("application/json")) {
+      const body = await req.json();
+      content = body.content;
+      filename = body.filename;
+      language = body.language;
+      customSlug = body.slug;
+    } else {
+      content = await req.text();
+      filename = req.headers.get("X-Filename") || undefined;
+      language = req.headers.get("X-Language") || undefined;
+      customSlug = req.headers.get("X-Slug") || undefined;
+    }
+
+    if (!content) {
+      return Response.json({ error: "Content is required" }, { status: 400 });
+    }
+
+    let id: string;
+    try {
+      id = getOrCreateId(customSlug);
+    } catch (e: any) {
+      const status = e.message.includes("taken") ? 409 : 400;
+      return Response.json({ error: e.message }, { status });
+    }
+
+    if (!language && filename) {
+      language = inferLanguage(filename);
+    }
+
+    db.run(
+      "INSERT INTO pastes (id, content, filename, language) VALUES (?, ?, ?, ?)",
+      [id, content, filename || null, language || null]
+    );
+
+    const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+    return Response.json({
+      id,
+      url: `${baseUrl}/${id}`,
+      raw: `${baseUrl}/${id}/raw`,
+    });
+  }
+
+  // Create paste - Form submission
+  if (method === "POST" && path === "/new") {
+    if (!checkAuth(req)) return unauthorizedResponse();
+
+    const form = await req.formData();
+    const content = form.get("content") as string;
+    const filename = (form.get("filename") as string) || undefined;
+    const language = (form.get("language") as string) || undefined;
+    const customSlug = (form.get("slug") as string) || undefined;
+
+    if (!content) {
+      return new Response(newPastePage("Content is required"), {
+        status: 400,
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    let id: string;
+    try {
+      id = getOrCreateId(customSlug);
+    } catch (e: any) {
+      const status = e.message.includes("taken") ? 409 : 400;
+      return new Response(newPastePage(e.message), {
+        status,
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    const inferredLang = language || inferLanguage(filename || undefined);
+
+    db.run(
+      "INSERT INTO pastes (id, content, filename, language) VALUES (?, ?, ?, ?)",
+      [id, content, filename || null, inferredLang || null]
+    );
+
+    return Response.redirect(`${url.origin}/${id}`, 302);
+  }
+
+  // New paste form
+  if (method === "GET" && path === "/new") {
+    if (!checkAuth(req)) return unauthorizedResponse();
+    
+    return new Response(newPastePage(), {
+      headers: { "Content-Type": "text/html" },
+    });
+  }
+
+  // Delete paste
+  if (method === "DELETE" && path.match(/^\/[^/]+$/)) {
+    if (!checkAuth(req)) return unauthorizedResponse();
+
+    const id = path.slice(1);
+    const result = db.run("DELETE FROM pastes WHERE id = ?", [id]);
+
+    if (result.changes === 0) {
+      return Response.json({ error: "Paste not found" }, { status: 404 });
+    }
+
+    return Response.json({ deleted: true });
+  }
+
+  // Get raw paste
+  if (method === "GET" && path.match(/^\/[^/]+\/raw$/)) {
+    const id = path.slice(1, -4);
+    const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as Paste | null;
+
+    if (!paste) {
+      return new Response("Paste not found", { status: 404 });
+    }
+
+    return new Response(paste.content, {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  // Get paste (HTML view)
+  if (method === "GET" && path.match(/^\/[^/]+$/)) {
+    const id = path.slice(1);
+
+    if (id === "new" || id === "api") {
+      return new Response(errorPage("Not found"), {
+        status: 404,
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as Paste | null;
+
+    if (!paste) {
+      return new Response(errorPage("Paste not found"), {
+        status: 404,
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    return new Response(renderPaste(paste), {
+      headers: { "Content-Type": "text/html" },
+    });
+  }
+
+  // Home page
+  if (method === "GET" && path === "/") {
+    return new Response(homeHtml(), {
+      headers: { "Content-Type": "text/html" },
+    });
+  }
+
+  return new Response(errorPage("Not found"), {
+    status: 404,
+    headers: { "Content-Type": "text/html" },
+  });
 }
 
 console.log(`strings running on http://localhost:${PORT}`);
 
 export default {
   port: PORT,
-  fetch: app.fetch,
+  fetch: handleRequest,
 };
