@@ -21,7 +21,7 @@
           # Fixed-output derivation - allows network access but requires hash
           outputHashMode = "recursive";
           outputHashAlgo = "sha256";
-          outputHash = "sha256-yS8Mf/SZNuOMJPBFqvHF7qTk7lWNQZLb1KWkwPCDdBQ=";
+          outputHash = "sha256-40uExawvAkHS9Sz8KRo6tpbKXNkkxbzBvdCkULruYqM=";
 
           buildPhase = ''
             runHook preBuild
