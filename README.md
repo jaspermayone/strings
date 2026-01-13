@@ -1,6 +1,6 @@
 # strings
 
-Minimal pastebin. That's it.
+this is a minimal pastebin I designed for Wentworth Institute of Technology's Coding Club
 
 ## Features
 
@@ -30,7 +30,7 @@ Add to your flake inputs:
 
 ```nix
 {
-  inputs.strings.url = "github:yourusername/strings";
+  inputs.strings.url = "github:jaspermayone/strings";
 }
 ```
 
