@@ -10,7 +10,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        
+
         strings = pkgs.stdenv.mkDerivation {
           pname = "strings";
           version = "0.1.0";
@@ -28,13 +28,13 @@
 
           installPhase = ''
             runHook preInstall
-            
+
             mkdir -p $out/lib/strings $out/bin
             cp -r src package.json node_modules $out/lib/strings/
-            
+
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/strings \
               --add-flags "run $out/lib/strings/src/index.ts"
-            
+
             runHook postInstall
           '';
 
@@ -47,7 +47,7 @@
       {
         packages.default = strings;
         packages.strings = strings;
-        
+
         packages.cli = pkgs.writeShellScriptBin "strings-cli" (builtins.readFile ./cli/strings);
 
         devShells.default = pkgs.mkShell {
@@ -56,106 +56,142 @@
       }
     ) // {
       nixosModules.default = { config, lib, pkgs, ... }:
-        with lib;
         let
           cfg = config.services.strings;
-        in
-        {
-          options.services.strings = {
-            enable = mkEnableOption "strings pastebin service";
 
-            package = mkOption {
-              type = types.package;
-              default = self.packages.${pkgs.system}.default;
-              description = "The strings package to use";
-            };
+          instanceOptions = { name, ... }: {
+            options = {
+              enable = lib.mkEnableOption "strings pastebin instance";
 
-            port = mkOption {
-              type = types.port;
-              default = 3000;
-              description = "Port to listen on";
-            };
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = self.packages.${pkgs.system}.default;
+                description = "The strings package to use";
+              };
 
-            username = mkOption {
-              type = types.str;
-              default = "admin";
-              description = "Username for basic auth";
-            };
+              port = lib.mkOption {
+                type = lib.types.port;
+                default = 3000;
+                description = "Port to listen on";
+              };
 
-            password = mkOption {
-              type = types.nullOr types.str;
-              default = null;
-              description = "Password for basic auth";
-            };
+              username = lib.mkOption {
+                type = lib.types.str;
+                default = "admin";
+                description = "Username for basic auth";
+              };
 
-            passwordFile = mkOption {
-              type = types.nullOr types.path;
-              default = null;
-              description = "File containing the password (alternative to password)";
-            };
+              password = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Password for basic auth (not recommended, use passwordFile)";
+              };
 
-            baseUrl = mkOption {
-              type = types.str;
-              default = "http://localhost:3000";
-              description = "Public URL for the service";
-            };
+              passwordFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "File containing AUTH_PASSWORD=<password>";
+              };
 
-            dataDir = mkOption {
-              type = types.path;
-              default = "/var/lib/strings";
-              description = "Directory to store the database";
+              baseUrl = lib.mkOption {
+                type = lib.types.str;
+                description = "Public URL for the service (e.g., https://paste.example.com)";
+              };
+
+              dataDir = lib.mkOption {
+                type = lib.types.path;
+                default = "/var/lib/strings-${name}";
+                description = "Directory to store the database";
+              };
             };
           };
 
-          config = mkIf cfg.enable {
-            assertions = [
-              {
-                assertion = cfg.password != null || cfg.passwordFile != null;
-                message = "services.strings: either password or passwordFile must be set";
-              }
-            ];
-
-            users.users.strings = {
-              isSystemUser = true;
-              group = "strings";
-              home = cfg.dataDir;
-              createHome = true;
+          enabledInstances = lib.filterAttrs (_: inst: inst.enable) cfg.instances;
+        in
+        {
+          options.services.strings = {
+            instances = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule instanceOptions);
+              default = { };
+              description = "Strings pastebin instances";
+              example = lib.literalExpression ''
+                {
+                  main = {
+                    enable = true;
+                    baseUrl = "https://paste.example.com";
+                    port = 3000;
+                    username = "admin";
+                    passwordFile = config.age.secrets.strings-main.path;
+                  };
+                  secondary = {
+                    enable = true;
+                    baseUrl = "https://paste2.example.com";
+                    port = 3001;
+                    username = "user";
+                    passwordFile = config.age.secrets.strings-secondary.path;
+                  };
+                }
+              '';
             };
-            users.groups.strings = { };
+          };
 
-            systemd.services.strings = {
-              description = "strings pastebin";
-              after = [ "network.target" ];
-              wantedBy = [ "multi-user.target" ];
+          config = lib.mkIf (enabledInstances != { }) {
+            assertions = lib.mapAttrsToList (name: inst: {
+              assertion = inst.password != null || inst.passwordFile != null;
+              message = "services.strings.instances.${name}: either password or passwordFile must be set";
+            }) enabledInstances;
 
-              serviceConfig = {
-                Type = "simple";
-                User = "strings";
-                Group = "strings";
-                WorkingDirectory = cfg.dataDir;
-                ExecStart = "${cfg.package}/bin/strings";
-                Restart = "on-failure";
-                RestartSec = 5;
-
-                # Hardening
-                NoNewPrivileges = true;
-                PrivateTmp = true;
-                ProtectSystem = "strict";
-                ProtectHome = true;
-                ReadWritePaths = [ cfg.dataDir ];
+            users.users = lib.mapAttrs' (name: inst: {
+              name = "strings-${name}";
+              value = {
+                isSystemUser = true;
+                group = "strings-${name}";
+                home = inst.dataDir;
+                createHome = true;
               };
+            }) enabledInstances;
 
-              environment = {
-                PORT = toString cfg.port;
-                BASE_URL = cfg.baseUrl;
-                DB_PATH = "${cfg.dataDir}/strings.db";
-                AUTH_USERNAME = cfg.username;
-              } // (if cfg.passwordFile != null then {
-                AUTH_PASSWORD_FILE = toString cfg.passwordFile;
-              } else {
-                AUTH_PASSWORD = cfg.password;
-              });
-            };
+            users.groups = lib.mapAttrs' (name: _: {
+              name = "strings-${name}";
+              value = { };
+            }) enabledInstances;
+
+            systemd.services = lib.mapAttrs' (name: inst: {
+              name = "strings-${name}";
+              value = {
+                description = "strings pastebin (${name})";
+                after = [ "network.target" ];
+                wantedBy = [ "multi-user.target" ];
+
+                serviceConfig = {
+                  Type = "simple";
+                  User = "strings-${name}";
+                  Group = "strings-${name}";
+                  WorkingDirectory = inst.dataDir;
+                  ExecStart = "${inst.package}/bin/strings";
+                  Restart = "on-failure";
+                  RestartSec = 5;
+
+                  # Hardening
+                  NoNewPrivileges = true;
+                  PrivateTmp = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  ReadWritePaths = [ inst.dataDir ];
+                } // lib.optionalAttrs (inst.passwordFile != null) {
+                  EnvironmentFile = inst.passwordFile;
+                };
+
+                environment = {
+                  PORT = toString inst.port;
+                  BASE_URL = inst.baseUrl;
+                  DB_PATH = "${inst.dataDir}/strings.db";
+                  AUTH_USERNAME = inst.username;
+                } // lib.optionalAttrs (inst.password != null) {
+                  AUTH_PASSWORD = inst.password;
+                };
+              };
+            }) enabledInstances;
           };
         };
     };
