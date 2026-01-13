@@ -151,5 +151,4 @@ pbpaste | strings
 | `BASE_URL` | `http://localhost:3000` | Public URL (for response) |
 
 ## License
-
-MIT
+See license.md file.
