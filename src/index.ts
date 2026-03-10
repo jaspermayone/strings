@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { readFileSync } from "fs";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 
 // Config from environment
 const PORT = parseInt(process.env.PORT || "3000");
@@ -23,6 +24,15 @@ function loadPassword(): string {
 
 const PASSWORD = loadPassword();
 
+// Session store: token -> username
+const sessions = new Map<string, string>();
+
+function getSession(c: any): string | null {
+  const token = getCookie(c, "session");
+  if (!token || !sessions.has(token)) return null;
+  return sessions.get(token)!;
+}
+
 // Initialize database
 const db = new Database(DB_PATH);
 db.run(`
@@ -36,8 +46,8 @@ db.run(`
 `);
 
 // Generate random ID
-function generateId(length = 8): string {
-  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function generateId(length = 6): string {
+  const chars = "abcdefghijkmnpqrstuvwxyz0123456789";
   let result = "";
   for (let i = 0; i < length; i++) {
     result += chars[Math.floor(Math.random() * chars.length)];
@@ -50,9 +60,9 @@ function isValidSlug(slug: string): boolean {
   return /^[a-zA-Z0-9_-]{1,64}$/.test(slug);
 }
 
-// Check if ID exists
+// Check if ID exists (case-insensitive)
 function idExists(id: string): boolean {
-  const row = db.query("SELECT 1 FROM pastes WHERE id = ?").get(id);
+  const row = db.query("SELECT 1 FROM pastes WHERE LOWER(id) = LOWER(?)").get(id);
   return row !== null;
 }
 
@@ -227,14 +237,14 @@ app.get("/new", auth, (c) => {
 
 // Get paste (HTML view)
 app.get("/:id", async (c) => {
-  const id = c.req.param("id");
+  const id = c.req.param("id").toLowerCase();
 
   // Don't match special routes
-  if (id === "new" || id === "api") {
+  if (["new", "api", "login", "logout", "admin"].includes(id)) {
     return c.notFound();
   }
 
-  const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as any;
+  const paste = db.query("SELECT * FROM pastes WHERE LOWER(id) = ?").get(id) as any;
 
   if (!paste) {
     return c.html(errorPage("Paste not found"), 404);
@@ -245,9 +255,9 @@ app.get("/:id", async (c) => {
 
 // Get raw paste
 app.get("/:id/raw", async (c) => {
-  const id = c.req.param("id");
+  const id = c.req.param("id").toLowerCase();
 
-  const paste = db.query("SELECT * FROM pastes WHERE id = ?").get(id) as any;
+  const paste = db.query("SELECT * FROM pastes WHERE LOWER(id) = ?").get(id) as any;
 
   if (!paste) {
     return c.text("Paste not found", 404);
@@ -256,11 +266,14 @@ app.get("/:id/raw", async (c) => {
   return c.text(paste.content);
 });
 
-// Delete paste
-app.delete("/:id", auth, async (c) => {
-  const id = c.req.param("id");
+// Delete paste (accepts session cookie or basic auth)
+app.delete("/:id", async (c, next) => {
+  if (getSession(c)) return next();
+  return auth(c, next);
+}, async (c) => {
+  const id = c.req.param("id").toLowerCase();
 
-  const result = db.run("DELETE FROM pastes WHERE id = ?", [id]);
+  const result = db.run("DELETE FROM pastes WHERE LOWER(id) = ?", [id]);
 
   if (result.changes === 0) {
     return c.json({ error: "Paste not found" }, 404);
@@ -271,10 +284,47 @@ app.delete("/:id", auth, async (c) => {
 
 // Home page
 app.get("/", (c) => {
-  return c.html(homePage());
+  const user = getSession(c);
+  return c.html(homePage(!!user));
 });
 
-function homePage(): string {
+// Login page
+app.get("/login", (c) => {
+  if (getSession(c)) return c.redirect("/admin");
+  return c.html(loginPage());
+});
+
+app.post("/login", async (c) => {
+  const form = await c.req.formData();
+  const user = form.get("username") as string;
+  const pass = form.get("password") as string;
+
+  if (user !== USERNAME || pass !== PASSWORD) {
+    return c.html(loginPage("Invalid username or password"), 401);
+  }
+
+  const token = crypto.randomUUID();
+  sessions.set(token, user);
+  setCookie(c, "session", token, { httpOnly: true, path: "/" });
+  return c.redirect("/admin");
+});
+
+// Logout
+app.get("/logout", (c) => {
+  const token = getCookie(c, "session");
+  if (token) sessions.delete(token);
+  deleteCookie(c, "session", { path: "/" });
+  return c.redirect("/login");
+});
+
+// Admin: list all pastes
+app.get("/admin", (c) => {
+  if (!getSession(c)) return c.redirect("/login");
+  const pastes = db.query("SELECT * FROM pastes ORDER BY created_at DESC").all() as any[];
+  return c.html(adminPage(pastes));
+});
+
+function homePage(loggedIn = false): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -305,6 +355,7 @@ function homePage(): string {
     .endpoint { color: #7ee787; }
     .comment { color: #8b949e; }
     a { color: #58a6ff; }
+    .actions { display: flex; gap: 0.75rem; margin-bottom: 2rem; align-items: center; }
     .btn {
       display: inline-block;
       background: #238636;
@@ -312,9 +363,18 @@ function homePage(): string {
       padding: 0.75rem 1.5rem;
       border-radius: 6px;
       text-decoration: none;
-      margin-bottom: 2rem;
     }
     .btn:hover { background: #2ea043; }
+    .btn-secondary {
+      display: inline-block;
+      background: #21262d;
+      color: #c9d1d9;
+      padding: 0.75rem 1.5rem;
+      border-radius: 6px;
+      text-decoration: none;
+      border: 1px solid #30363d;
+    }
+    .btn-secondary:hover { background: #30363d; }
   </style>
 </head>
 <body>
@@ -322,7 +382,13 @@ function homePage(): string {
     <h1>strings</h1>
     <p class="subtitle">minimal pastebin</p>
 
-    <a href="/new" class="btn">+ New Paste</a>
+    <div class="actions">
+      <a href="/new" class="btn">+ New Paste</a>
+      ${loggedIn
+        ? `<a href="/admin" class="btn-secondary">All Pastes</a><a href="/logout" class="btn-secondary">Sign out</a>`
+        : `<a href="/login" class="btn-secondary">Sign in</a>`
+      }
+    </div>
 
     <h2>API</h2>
     <pre><code><span class="comment"># Create a paste (basic auth required)</span>
@@ -696,6 +762,247 @@ function errorPage(message: string): string {
     <h1>${escapeHtml(message)}</h1>
     <a href="/">← back home</a>
   </div>
+</body>
+</html>`;
+}
+
+function loginPage(error?: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in - strings</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 360px;
+    }
+    h1 { color: #58a6ff; margin: 0 0 0.25rem; font-size: 1.5rem; }
+    .subtitle { color: #8b949e; margin: 0 0 1.5rem; font-size: 0.875rem; }
+    .error {
+      background: #3d1f1f;
+      border: 1px solid #f85149;
+      color: #f85149;
+      padding: 0.75rem 1rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      font-size: 0.875rem;
+    }
+    form { display: flex; flex-direction: column; gap: 1rem; }
+    label { display: flex; flex-direction: column; gap: 0.4rem; font-size: 0.875rem; color: #8b949e; }
+    input {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.65rem 0.75rem;
+      color: #c9d1d9;
+      font-size: 1rem;
+    }
+    input:focus { outline: none; border-color: #58a6ff; }
+    button {
+      background: #238636;
+      color: #fff;
+      border: none;
+      padding: 0.75rem;
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      margin-top: 0.25rem;
+    }
+    button:hover { background: #2ea043; }
+    .back { text-align: center; margin-top: 1rem; font-size: 0.875rem; }
+    .back a { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>strings</h1>
+    <p class="subtitle">Sign in to manage your pastes</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
+    <form method="POST" action="/login">
+      <label>
+        Username
+        <input type="text" name="username" autocomplete="username" autofocus required>
+      </label>
+      <label>
+        Password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+    <div class="back"><a href="/">← back</a></div>
+  </div>
+</body>
+</html>`;
+}
+
+function adminPage(pastes: any[]): string {
+  const rows = pastes.map((p) => {
+    const name = p.filename ? escapeHtml(p.filename) : p.id;
+    const lang = p.language ? escapeHtml(p.language) : "—";
+    const date = new Date(p.created_at * 1000).toLocaleString("en-US", {
+      month: "short", day: "numeric", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+    const preview = escapeHtml(p.content.slice(0, 80)).replace(/\n/g, " ");
+    return `
+    <tr>
+      <td><a href="/${p.id}">${escapeHtml(p.id)}</a></td>
+      <td>${name}</td>
+      <td><span class="badge">${lang}</span></td>
+      <td class="preview">${preview}${p.content.length > 80 ? "…" : ""}</td>
+      <td>${date}</td>
+      <td>
+        <a href="/${p.id}/raw" class="action">raw</a>
+        <button class="action danger" onclick="deletePaste('${escapeHtml(p.id)}', this)">delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>All Pastes - strings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+    }
+    .header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .header a { color: #58a6ff; text-decoration: none; }
+    .header-right { display: flex; gap: 1rem; align-items: center; }
+    .header-right a { color: #8b949e; font-size: 0.875rem; }
+    .header-right a:hover { color: #c9d1d9; }
+    .btn {
+      display: inline-block;
+      background: #238636;
+      color: #fff !important;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.875rem;
+    }
+    .btn:hover { background: #2ea043; }
+    .main { padding: 2rem; }
+    h2 { margin-bottom: 1rem; font-size: 1.25rem; }
+    .count { color: #8b949e; font-size: 0.875rem; font-weight: normal; margin-left: 0.5rem; }
+    .empty { color: #8b949e; text-align: center; padding: 3rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.75rem;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid #30363d;
+    }
+    td {
+      padding: 0.6rem 0.75rem;
+      border-bottom: 1px solid #21262d;
+      font-size: 0.875rem;
+      vertical-align: middle;
+    }
+    tr:hover td { background: #161b22; }
+    td a { color: #58a6ff; text-decoration: none; }
+    td a:hover { text-decoration: underline; }
+    .badge {
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 0.15rem 0.5rem;
+      font-size: 0.75rem;
+      font-family: monospace;
+      color: #8b949e;
+    }
+    .preview { color: #8b949e; font-family: monospace; font-size: 0.8rem; max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .action {
+      background: none;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      text-decoration: none;
+      margin-left: 0.25rem;
+    }
+    .action:hover { color: #c9d1d9; border-color: #8b949e; }
+    .action.danger:hover { color: #f85149; border-color: #f85149; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <a href="/">strings</a>
+      <span style="color:#8b949e"> / all pastes</span>
+    </div>
+    <div class="header-right">
+      <a href="/new" class="btn">+ New Paste</a>
+      <a href="/logout">Sign out</a>
+    </div>
+  </div>
+  <div class="main">
+    <h2>All Pastes <span class="count">${pastes.length} total</span></h2>
+    ${pastes.length === 0
+      ? `<p class="empty">No pastes yet. <a href="/new">Create one</a>.</p>`
+      : `<table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Filename</th>
+          <th>Language</th>
+          <th>Preview</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`
+    }
+  </div>
+  <script>
+    async function deletePaste(id, btn) {
+      if (!confirm('Delete paste ' + id + '?')) return;
+      const res = await fetch('/' + id, { method: 'DELETE' });
+      if (res.ok) {
+        btn.closest('tr').remove();
+        const count = document.querySelector('.count');
+        const n = parseInt(count.textContent) - 1;
+        count.textContent = n + ' total';
+      } else {
+        alert('Delete failed');
+      }
+    }
+  </script>
 </body>
 </html>`;
 }
