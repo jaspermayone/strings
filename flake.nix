@@ -11,34 +11,10 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Pre-fetch node_modules as a fixed-output derivation
-        nodeModules = pkgs.stdenv.mkDerivation {
-          name = "strings-node-modules";
-          src = ./.;
-
-          nativeBuildInputs = [ pkgs.bun pkgs.cacert ];
-
-          # Fixed-output derivation - allows network access but requires hash
-          outputHashMode = "recursive";
-          outputHashAlgo = "sha256";
-          outputHash = "sha256-40uExawvAkHS9Sz8KRo6tpbKXNkkxbzBvdCkULruYqM=";
-
-          buildPhase = ''
-            runHook preBuild
-            export HOME=$(mktemp -d)
-            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
-            bun install --frozen-lockfile
-            runHook postBuild
-          '';
-
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out
-            cp -r node_modules $out/
-            runHook postInstall
-          '';
-        };
-
+        # The app imports only bun:sqlite and the Bun standard library, so it
+        # has no npm dependencies and needs no node_modules. If a dependency is
+        # ever added back, restore a fixed-output derivation that runs
+        # `bun install` here and link its node_modules in below.
         strings = pkgs.stdenv.mkDerivation {
           pname = "strings";
           version = "0.1.0";
@@ -47,7 +23,7 @@
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          # No build phase needed - deps are pre-fetched
+          # Bun runs the TypeScript source directly, so there is nothing to build.
           dontBuild = true;
 
           installPhase = ''
@@ -55,7 +31,6 @@
 
             mkdir -p $out/lib/strings $out/bin
             cp -r src package.json $out/lib/strings/
-            ln -s ${nodeModules}/node_modules $out/lib/strings/node_modules
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/strings \
               --add-flags "run $out/lib/strings/src/index.ts"
